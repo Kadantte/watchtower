@@ -15,9 +15,43 @@ import (
 	"github.com/nicholas-fedor/watchtower/internal/actions"
 	mockActions "github.com/nicholas-fedor/watchtower/internal/actions/mocks"
 	"github.com/nicholas-fedor/watchtower/internal/metrics"
+	"github.com/nicholas-fedor/watchtower/pkg/container"
 	"github.com/nicholas-fedor/watchtower/pkg/filters"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// createNetworkModeContainer builds a container that joins another container's
+// network namespace, with Compose project and service labels applied.
+func createNetworkModeContainer(
+	id, name, project, service, networkMode string,
+) types.Container {
+	hostConfig := &dockerContainer.HostConfig{
+		PortBindings: dockerNetwork.PortMap{},
+	}
+	if networkMode != "" {
+		hostConfig.NetworkMode = dockerContainer.NetworkMode(networkMode)
+	}
+
+	content := dockerContainer.InspectResponse{
+		ID:    id,
+		Image: "image:latest",
+		Name:  name,
+		State: &dockerContainer.State{Running: true},
+		Created: time.Now().
+			AddDate(0, 0, -1).
+			Format(time.RFC3339Nano),
+		HostConfig: hostConfig,
+		Config: &dockerContainer.Config{
+			Labels: map[string]string{
+				"com.docker.compose.project": project,
+				"com.docker.compose.service": service,
+			},
+			ExposedPorts: dockerNetwork.PortSet{},
+		},
+	}
+
+	return container.NewContainer(nil, &content, mockActions.CreateMockImageInfo("image:latest"))
+}
 
 // createStaleContainersForTest creates two stale containers and returns them along with TestData.
 // This is a helper function used by tests that need to set up containers for rolling restart scenarios.
@@ -537,9 +571,9 @@ var _ = ginkgo.Describe("the update action", func() {
 			gomega.Expect(report.Restarted()).To(gomega.HaveLen(1)) // B
 		})
 
-		ginkgo.It("should handle containers with no dependencies that are restarted", func() {
-			// Test a container that gets restarted for reasons other than dependencies
-			// This is harder to test directly, but we can verify the logic handles it
+		ginkgo.It("should drop a linked restart when nothing is stale", func() {
+			// Restart marks are derived from containers that are still stale.
+			// A mark with no stale anchor does not stop the container.
 			container := mockActions.CreateMockContainerWithConfig(
 				"standalone-container",
 				"/standalone-container",
@@ -553,7 +587,6 @@ var _ = ginkgo.Describe("the update action", func() {
 				},
 			)
 
-			// Manually set it to restart (simulating some other restart condition)
 			container.SetLinkedToRestarting(true)
 
 			client := mockActions.CreateMockClient(
@@ -575,8 +608,8 @@ var _ = ginkgo.Describe("the update action", func() {
 
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			gomega.Expect(report.Updated()).To(gomega.BeEmpty())
-			gomega.Expect(report.Restarted()).To(gomega.HaveLen(1))
-			gomega.Expect(report.Fresh()).To(gomega.BeEmpty())
+			gomega.Expect(report.Restarted()).To(gomega.BeEmpty())
+			gomega.Expect(container.IsLinkedToRestarting()).To(gomega.BeFalse())
 		})
 	})
 
@@ -780,6 +813,71 @@ var _ = ginkgo.Describe("the update action", func() {
 				gomega.Expect(dep1.ToRestart()).To(gomega.BeTrue())
 				gomega.Expect(dep2.ToRestart()).To(gomega.BeTrue())
 				gomega.Expect(dep3.ToRestart()).To(gomega.BeTrue())
+			})
+
+			ginkgo.It("marks a container sharing a network namespace across Compose projects", func() {
+				// gluetun and qbittorrent are separate Compose projects, which is
+				// the usual layout when one VPN container is shared between
+				// several stacks.
+				gluetun := createNetworkModeContainer(
+					"gluetun-id", "/gluetun", "gluetun", "app", "",
+				)
+				qbittorrent := createNetworkModeContainer(
+					"qbittorrent-id", "/qbittorrent", "qbittorrent", "app",
+					"container:gluetun",
+				)
+
+				containers := []types.Container{gluetun, qbittorrent}
+				gluetun.SetStale(true)
+
+				actions.UpdateImplicitRestart(testLogger(), containers, containers, true)
+
+				gomega.Expect(gluetun.ToRestart()).To(gomega.BeTrue())
+				gomega.Expect(qbittorrent.ToRestart()).To(gomega.BeTrue())
+			})
+
+			ginkgo.It("marks a dependent whose network mode still references the provider ID", func() {
+				// Moby inspect stores container:<id> until Watchtower rewrites
+				// it to a name. Matching must accept the ID form as well.
+				const providerID = "25e75393800b5c450a6841212a3b92ed28fa35414a586dec9f2c8a520d4910c2"
+
+				gluetun := createNetworkModeContainer(
+					providerID, "/gluetun", "gluetun", "app", "",
+				)
+				qbittorrent := createNetworkModeContainer(
+					"qbittorrent-id", "/qbittorrent", "qbittorrent", "app",
+					"container:"+providerID,
+				)
+
+				containers := []types.Container{gluetun, qbittorrent}
+				gluetun.SetStale(true)
+
+				actions.UpdateImplicitRestart(testLogger(), containers, containers, true)
+
+				gomega.Expect(gluetun.ToRestart()).To(gomega.BeTrue())
+				gomega.Expect(qbittorrent.ToRestart()).To(gomega.BeTrue())
+			})
+
+			ginkgo.It("does not treat a project-prefixed peer name as the network provider", func() {
+				gluetun := createNetworkModeContainer(
+					"gluetun-id", "/gluetun", "gluetun", "app", "",
+				)
+				decoy := createNetworkModeContainer(
+					"decoy-id", "/qbittorrent-gluetun", "other", "svc", "",
+				)
+				qbittorrent := createNetworkModeContainer(
+					"qbittorrent-id", "/qbittorrent", "qbittorrent", "app",
+					"container:gluetun",
+				)
+
+				containers := []types.Container{gluetun, decoy, qbittorrent}
+				decoy.SetStale(true)
+
+				actions.UpdateImplicitRestart(testLogger(), containers, containers, true)
+
+				gomega.Expect(decoy.ToRestart()).To(gomega.BeTrue())
+				gomega.Expect(gluetun.ToRestart()).To(gomega.BeFalse())
+				gomega.Expect(qbittorrent.ToRestart()).To(gomega.BeFalse())
 			})
 
 			ginkgo.It("should handle restarted containers with circular dependencies", func() {

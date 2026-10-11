@@ -14,12 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden the Runner (Step Security)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
       - name: Run pkg.go.dev Update
-        uses: nicholas-fedor/go-proxy-pull-action@c50853a69d82ff90712b966c39bb4819147db773 # v1.1.49
+        uses: nicholas-fedor/go-proxy-pull-action@8f784b07227e87c2d6555d3805c3a83e02e29227 # v1.1.52
         with:
           goproxy: https://proxy.golang.org
           import_path: github.com/nicholas-fedor/watchtower

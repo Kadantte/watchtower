@@ -3,6 +3,8 @@ package container
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -13,8 +15,8 @@ import (
 	dockerNetwork "github.com/moby/moby/api/types/network"
 	dockerClient "github.com/moby/moby/client"
 
+	"github.com/nicholas-fedor/watchtower/internal/compose"
 	"github.com/nicholas-fedor/watchtower/internal/util"
-	"github.com/nicholas-fedor/watchtower/pkg/compose"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
 
@@ -212,11 +214,13 @@ func (c *Container) ContainerInfo() *dockerContainer.InspectResponse {
 // Returns:
 //   - types.ContainerID: Container ID.
 func (c *Container) ID() types.ContainerID {
-	if c.containerInfo == nil {
+	info := c.ContainerInfo()
+
+	if info == nil {
 		return ""
 	}
 
-	return types.ContainerID(c.containerInfo.ID)
+	return types.ContainerID(info.ID)
 }
 
 // IsRunning checks if the container is currently running.
@@ -224,11 +228,13 @@ func (c *Container) ID() types.ContainerID {
 // Returns:
 //   - bool: True if running, false otherwise.
 func (c *Container) IsRunning() bool {
-	if c.containerInfo == nil || c.containerInfo.State == nil {
+	info := c.ContainerInfo()
+
+	if info == nil || info.State == nil {
 		return false
 	}
 
-	return c.containerInfo.State.Running
+	return info.State.Running
 }
 
 // IsRestarting checks if the container is currently restarting.
@@ -236,11 +242,13 @@ func (c *Container) IsRunning() bool {
 // Returns:
 //   - bool: True if restarting, false otherwise.
 func (c *Container) IsRestarting() bool {
-	if c.containerInfo == nil || c.containerInfo.State == nil {
+	info := c.ContainerInfo()
+
+	if info == nil || info.State == nil {
 		return false
 	}
 
-	return c.containerInfo.State.Restarting
+	return info.State.Restarting
 }
 
 // IsCreated checks if the container is in the Docker "created" state,
@@ -249,11 +257,13 @@ func (c *Container) IsRestarting() bool {
 // Returns:
 //   - bool: True if the container is in created state, false otherwise.
 func (c *Container) IsCreated() bool {
-	if c.containerInfo == nil || c.containerInfo.State == nil {
+	info := c.ContainerInfo()
+
+	if info == nil || info.State == nil {
 		return false
 	}
 
-	return c.containerInfo.State.Status == dockerContainer.StateCreated
+	return info.State.Status == dockerContainer.StateCreated
 }
 
 // Name returns the normalized name of the container.
@@ -314,7 +324,9 @@ func (c *Container) SetImageName(name string) {
 
 	// Keep Config.Image in sync so GetCreateConfig uses the pinned reference.
 	if c.containerInfo != nil && c.containerInfo.Config != nil {
-		c.containerInfo.Config.Image = normalized
+		c.replaceInspectLocked(func(info *dockerContainer.InspectResponse) {
+			info.Config.Image = normalized
+		})
 	}
 
 	c.imageName = normalized
@@ -360,9 +372,10 @@ func (c *Container) GetCreateConfig() *dockerContainer.Config {
 	config := *c.containerInfo.Config
 	hostConfig := c.containerInfo.HostConfig
 
-	// Handle missing image info case.
-	if c.imageInfo == nil {
-		clog.Warn().Msg("No image info available, using container config as-is")
+	// Handle missing image info, including a nil image Config. The containerd
+	// image store can return image inspect with Config unset.
+	if c.imageInfo == nil || c.imageInfo.Config == nil {
+		clog.Warn().Msg("No image config available, using container config as-is")
 
 		config.Image = c.imageNameLocked()
 
@@ -387,15 +400,19 @@ func (c *Container) GetCreateConfig() *dockerContainer.Config {
 		config.Hostname = "" // Clear hostname for UTS mode.
 	}
 
-	if util.SliceEqual(config.Entrypoint, imageConfig.Entrypoint) {
+	if slices.Equal(config.Entrypoint, imageConfig.Entrypoint) {
 		config.Entrypoint = nil
-		if util.SliceEqual(config.Cmd, imageConfig.Cmd) {
+		if slices.Equal(config.Cmd, imageConfig.Cmd) {
 			config.Cmd = nil
 		}
 	}
-	// Clear HEALTHCHECK if it matches the image default.
+	// Clear HEALTHCHECK if it matches the image default. Work on a copy, as
+	// the health check is shared with the container's inspect data.
 	if config.Healthcheck != nil && imageConfig.Healthcheck != nil {
-		if util.SliceEqual(config.Healthcheck.Test, imageConfig.Healthcheck.Test) {
+		healthcheck := *config.Healthcheck
+		config.Healthcheck = &healthcheck
+
+		if slices.Equal(config.Healthcheck.Test, imageConfig.Healthcheck.Test) {
 			config.Healthcheck.Test = nil
 		}
 
@@ -434,7 +451,9 @@ func (c *Container) GetCreateConfig() *dockerContainer.Config {
 	config.Volumes = util.StructMapSubtract(config.Volumes, imageConfig.Volumes)
 
 	// Ensure ExposedPorts is initialized before removing image-exposed ports
-	// and adding ports from host config bindings.
+	// and adding ports from host config bindings. Work on a copy, as the map
+	// is shared with the container's inspect data.
+	config.ExposedPorts = maps.Clone(config.ExposedPorts)
 	if config.ExposedPorts == nil {
 		config.ExposedPorts = dockerNetwork.PortSet{}
 	}
@@ -460,7 +479,8 @@ func (c *Container) GetCreateConfig() *dockerContainer.Config {
 
 // GetCreateHostConfig generates a host configuration for recreation.
 //
-// It adjusts link formats for Docker API compatibility.
+// It adjusts link formats for Docker API compatibility and copies slices that
+// must not alias inspect data.
 //
 // Returns:
 //   - *dockerContainerType.HostConfig: Host configuration for container creation.
@@ -488,6 +508,12 @@ func (c *Container) GetCreateHostConfig() *dockerContainer.HostConfig {
 		devicesCopy := make([]dockerContainer.DeviceMapping, len(hostConfig.Devices))
 		copy(devicesCopy, hostConfig.Devices)
 		hostConfig.Devices = devicesCopy
+	}
+
+	if len(hostConfig.VolumesFrom) > 0 {
+		// Copy VolumesFrom so the returned host config does not alias inspect.
+		volumesFromCopy := slices.Clone(hostConfig.VolumesFrom)
+		hostConfig.VolumesFrom = volumesFromCopy
 	}
 
 	// Adjust link format for each entry (and drop invalid ones).
@@ -577,28 +603,42 @@ func (c *Container) VerifyConfiguration() error {
 	}
 
 	// Ensure ExposedPorts is initialized if PortBindings exist.
-	if len(c.containerInfo.HostConfig.PortBindings) > 0 &&
-		c.containerInfo.Config.ExposedPorts == nil {
-		c.containerInfo.Config.ExposedPorts = dockerNetwork.PortSet{}
+	initExposed := len(c.containerInfo.HostConfig.PortBindings) > 0 &&
+		c.containerInfo.Config.ExposedPorts == nil
 
-		clog.Debug().Msg("Initialized ExposedPorts due to PortBindings")
-	}
-
-	// Validate port bindings for empty or malformed port values.
+	// Find port bindings with empty port values.
 	// Docker rejects ports with empty port numbers (e.g., "/tcp") with
 	// "invalid port range: value is empty" during ContainerCreate.
+	var emptyPorts []dockerNetwork.Port
+
 	for port := range c.containerInfo.HostConfig.PortBindings {
-		portStr := port.Port()
-
-		// Skip and remove completely empty port entries.
-		if portStr == "" {
-			clog.Warn().Msg("Skipping empty port binding and exposed port")
-
-			delete(c.containerInfo.HostConfig.PortBindings, port)
-			delete(c.containerInfo.Config.ExposedPorts, port)
-
-			continue
+		if port.Port() == "" {
+			emptyPorts = append(emptyPorts, port)
 		}
+	}
+
+	if initExposed || len(emptyPorts) > 0 {
+		c.replaceInspectLocked(func(info *dockerContainer.InspectResponse) {
+			exposed := maps.Clone(info.Config.ExposedPorts)
+			if exposed == nil && initExposed {
+				exposed = dockerNetwork.PortSet{}
+
+				clog.Debug().Msg("Initialized ExposedPorts due to PortBindings")
+			}
+
+			bindings := maps.Clone(info.HostConfig.PortBindings)
+
+			// Skip and remove completely empty port entries.
+			for _, port := range emptyPorts {
+				clog.Warn().Msg("Skipping empty port binding and exposed port")
+
+				delete(bindings, port)
+				delete(exposed, port)
+			}
+
+			info.Config.ExposedPorts = exposed
+			info.HostConfig.PortBindings = bindings
+		})
 	}
 
 	clog.Debug().Msg("Verified container configuration")
@@ -668,6 +708,10 @@ func filterSelfReferences(links []string, containerName string) []string {
 //  3. HostConfig.Links (legacy Docker links)
 //  4. NetworkMode.ConnectedContainer() (container network mode dependencies)
 //
+// HostConfig.VolumesFrom identities are always appended after those sources.
+// Duplicates are skipped. Label selection does not hide volumes-from, because
+// recreate must still order the volume source before this container.
+//
 // Self-references are filtered out from all link sources to prevent circular
 // dependencies where a container would depend on itself. This ensures the
 // dependency resolution algorithm can process containers in a valid topological order.
@@ -683,22 +727,54 @@ func (c *Container) Links(useComposeDependsOn bool) []string {
 		Logger()
 	clog := &clogVal
 
-	// Check Watchtower's depends-on label first.
-	if links := GetLinksFromWatchtowerLabel(c, clog); links != nil {
-		return filterSelfReferences(links, c.Name())
-	}
+	var links []string
 
-	// Check compose depends-on label if enabled.
-	if useComposeDependsOn {
-		if links := getLinksFromComposeLabel(c, clog); links != nil {
-			return filterSelfReferences(links, c.Name())
+	// Check Watchtower's depends-on label first.
+	if labelLinks := GetLinksFromWatchtowerLabel(c, clog); labelLinks != nil {
+		links = labelLinks
+	} else if useComposeDependsOn {
+		// Use Compose depends_on only when the Watchtower label is absent.
+		if composeLinks := getLinksFromComposeLabel(c, clog); composeLinks != nil {
+			links = composeLinks
 		}
 	}
 
-	// Fall back to HostConfig links and network mode.
-	links := getLinksFromHostConfig(c, clog)
+	if links == nil {
+		// No label dependencies. Use HostConfig links and network mode.
+		links = getLinksFromHostConfig(c, clog)
+	}
+
+	// Always append volumes-from identities. Label selection must not hide the
+	// volume source, or recreate can still target a removed container ID.
+	links = appendUniqueLinks(links, volumesFromLinks(c))
 
 	return filterSelfReferences(links, c.Name())
+}
+
+// replaceInspectLocked replaces the container's inspect data with a copy that
+// change modifies. Inspect data returned earlier by ContainerInfo is never
+// changed, so callers can read it without holding the lock. change receives
+// copies of Config and HostConfig, and must copy any map or slice in them
+// before changing it. The caller must hold c.mu for writing, and the inspect
+// data must not be nil.
+//
+// Parameters:
+//   - change: Modifies the copy of the inspect data.
+func (c *Container) replaceInspectLocked(change func(info *dockerContainer.InspectResponse)) {
+	info := *c.containerInfo
+
+	if info.Config != nil {
+		config := *info.Config
+		info.Config = &config
+	}
+
+	if info.HostConfig != nil {
+		hostConfig := *info.HostConfig
+		info.HostConfig = &hostConfig
+	}
+
+	change(&info)
+	c.containerInfo = &info
 }
 
 // imageNameLocked returns the cached image name. The caller must hold c.mu.
@@ -719,7 +795,9 @@ func (c *Container) imageNameLocked() string {
 //   - string: Image name with a tag (e.g., "alpine:latest").
 func (c *Container) resolveImageName() string {
 	// Prefer the Zodiac label for the image name.
-	imageName, ok := c.getLabelValue(zodiacLabel)
+	// The caller holds c.mu or is constructing the container, so the label
+	// is read from the field rather than through ContainerInfo.
+	imageName, ok := labelValue(c.containerInfo, zodiacLabel)
 	if !ok {
 		if c.containerInfo == nil || c.containerInfo.Config == nil {
 			c.logger().Warn().
@@ -799,9 +877,9 @@ func ResolveContainerIdentifier(c types.Container) string {
 		return nameOrID(c)
 	}
 
-	projectName := compose.GetProjectName(nopLog(), labels)
-	serviceName := compose.GetServiceName(nopLog(), labels)
-	containerNumber := compose.GetContainerNumber(nopLog(), labels)
+	projectName := compose.GetProjectName(labels)
+	serviceName := compose.GetServiceName(labels)
+	containerNumber := compose.GetContainerNumber(labels)
 
 	// Handle replica containers
 	if projectName != "" && serviceName != "" &&
@@ -907,6 +985,8 @@ func GetLinksFromWatchtowerLabel(c *Container, clog *zerolog.Logger) []string {
 // Returns:
 //   - []string: List of linked container names, empty if label not present
 func getLinksFromComposeLabel(c *Container, clog *zerolog.Logger) []string {
+	info := c.ContainerInfo()
+
 	composeDependsOnLabelValue := c.getLabelValueOrEmpty(compose.ComposeDependsOnLabel)
 	clog.Debug().
 		Str("label", compose.ComposeDependsOnLabel).
@@ -923,7 +1003,7 @@ func getLinksFromComposeLabel(c *Container, clog *zerolog.Logger) []string {
 
 	services := compose.ParseDependsOnLabel(clog, composeDependsOnLabelValue)
 
-	projectName := compose.GetProjectName(clog, c.containerInfo.Config.Labels)
+	projectName := compose.GetProjectName(info.Config.Labels)
 
 	normalizedLinks := make([]string, 0, len(services))
 	for _, service := range services {
@@ -951,9 +1031,11 @@ func getLinksFromComposeLabel(c *Container, clog *zerolog.Logger) []string {
 
 // getLinksFromHostConfig extracts dependency links from Docker HostConfig.
 //
-// It parses HostConfig.Links and network mode to determine container dependencies.
-// If the container has a project label, link names are qualified with the project name
-// if they are not already qualified.
+// It parses HostConfig.Links and network mode to determine container
+// dependencies. If the container has a project label, legacy link names are
+// qualified with the project name if they are not already qualified. Network
+// mode is a Docker identity, not a Compose service name, and is not
+// project-prefixed. VolumesFrom is merged in Links, not here.
 //
 // Parameters:
 //   - c: Container instance
@@ -962,23 +1044,27 @@ func getLinksFromComposeLabel(c *Container, clog *zerolog.Logger) []string {
 // Returns:
 //   - []string: List of linked container names
 func getLinksFromHostConfig(c *Container, clog *zerolog.Logger) []string {
-	if c.containerInfo == nil || c.containerInfo.HostConfig == nil {
+	info := c.ContainerInfo()
+
+	if info == nil || info.HostConfig == nil {
 		return nil
 	}
 
-	projectName := compose.GetProjectName(clog, c.containerInfo.Config.Labels)
+	projectName := compose.GetProjectName(info.Config.Labels)
 
-	// Pre-allocate for links plus potential network mode dependency
-	capacity := len(c.containerInfo.HostConfig.Links)
+	hostConfig := info.HostConfig
 
-	networkMode := c.containerInfo.HostConfig.NetworkMode
+	// Pre-allocate for links plus a potential network mode dependency.
+	capacity := len(hostConfig.Links)
+
+	networkMode := hostConfig.NetworkMode
 	if networkMode.IsContainer() {
 		capacity++
 	}
 
 	normalizedLinks := make([]string, 0, capacity)
 
-	for _, link := range c.containerInfo.HostConfig.Links {
+	for _, link := range hostConfig.Links {
 		if !strings.Contains(link, ":") {
 			clog.Warn().
 				Str("link", link).
@@ -1005,12 +1091,13 @@ func getLinksFromHostConfig(c *Container, clog *zerolog.Logger) []string {
 	}
 
 	// Add network dependency.
+	//
+	// Unlike a Compose service reference, network mode is a Docker identity.
+	// The daemon stores container:<id> after create. List inspect rewrites
+	// that to container:<name>. Do not prefix either form with this
+	// container's Compose project.
 	if networkMode.IsContainer() {
 		normalizedName := util.NormalizeContainerName(networkMode.ConnectedContainer())
-		if projectName != "" && !strings.HasPrefix(normalizedName, projectName+"-") {
-			normalizedName = projectName + "-" + normalizedName
-		}
-
 		normalizedLinks = append(normalizedLinks, normalizedName)
 	}
 
@@ -1019,4 +1106,131 @@ func getLinksFromHostConfig(c *Container, clog *zerolog.Logger) []string {
 		Msg("Retrieved links from host config")
 
 	return normalizedLinks
+}
+
+// volumesFromLinks returns normalized HostConfig.VolumesFrom identities.
+//
+// VolumesFrom is a Docker identity (name or ID, optional :ro/:rw). Do not
+// prefix with this container's Compose project.
+//
+// Parameters:
+//   - c: Container instance.
+//
+// Returns:
+//   - []string: Normalized volumes-from container names or IDs.
+func volumesFromLinks(c *Container) []string {
+	info := c.ContainerInfo()
+
+	if info == nil || info.HostConfig == nil {
+		return nil
+	}
+
+	specs := info.HostConfig.VolumesFrom
+	if len(specs) == 0 {
+		return nil
+	}
+
+	links := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		name, _ := parseVolumesFromSpec(spec)
+		if name == "" {
+			// Skip empty or mode-only specs.
+			continue
+		}
+
+		links = append(links, util.NormalizeContainerName(name))
+	}
+
+	return links
+}
+
+// appendUniqueLinks appends extra names that are not already in links.
+//
+// Existing order is preserved. New names are appended in extra order.
+//
+// Parameters:
+//   - links: Existing dependency names.
+//   - extra: Additional names to merge.
+//
+// Returns:
+//   - []string: Merged list without duplicates.
+func appendUniqueLinks(links, extra []string) []string {
+	if len(extra) == 0 {
+		return links
+	}
+
+	seen := make(map[string]struct{}, len(links)+len(extra))
+	for _, link := range links {
+		seen[link] = struct{}{}
+	}
+
+	for _, link := range extra {
+		if _, exists := seen[link]; exists {
+			// Keep the earlier occurrence so label order wins.
+			continue
+		}
+
+		seen[link] = struct{}{}
+		links = append(links, link)
+	}
+
+	return links
+}
+
+// parseVolumesFromSpec splits a VolumesFrom entry into container identity and mode.
+//
+// Docker stores entries as name-or-id, optionally followed by :ro, :rw, or a
+// SELinux :z/:Z flag. A trailing colon suffix is treated as a mode only when
+// every comma-separated part is one of those flags.
+//
+// Parameters:
+//   - spec: VolumesFrom string from HostConfig.
+//
+// Returns:
+//   - string: Container name or ID.
+//   - string: Mode suffix without a leading colon, or empty.
+func parseVolumesFromSpec(spec string) (string, string) {
+	if spec == "" {
+		return "", ""
+	}
+
+	before, after, ok := strings.CutLast(spec, ":")
+	if !ok {
+		return spec, ""
+	}
+
+	suffix := after
+	if !isVolumesFromMode(suffix) {
+		// A colon that is not a volume mode stays part of the identity.
+		return spec, ""
+	}
+
+	return before, suffix
+}
+
+// isVolumesFromMode reports whether suffix is a Docker volumes-from access mode.
+//
+// Docker accepts ro, rw, and SELinux z or Z, including comma-separated
+// combinations such as ro,z.
+//
+// Parameters:
+//   - suffix: Trailing VolumesFrom mode after the last colon.
+//
+// Returns:
+//   - bool: True if every comma-separated part is ro, rw, z, or Z.
+func isVolumesFromMode(suffix string) bool {
+	if suffix == "" {
+		return false
+	}
+
+	for part := range strings.SplitSeq(suffix, ",") {
+		switch part {
+		case "ro", "rw", "z", "Z":
+			// Recognized volume access or SELinux relabel flag.
+		default:
+			return false
+		}
+	}
+
+	return true
 }

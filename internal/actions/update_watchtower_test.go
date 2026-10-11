@@ -9,6 +9,8 @@ import (
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
@@ -63,8 +65,10 @@ var _ = ginkgo.Describe("Watchtower container handling", func() {
 				To(gomega.Equal(int32(0)), "RemoveImageByID should not be called during Update")
 			gomega.Expect(client.TestData.RenameContainerCount.Load()).
 				To(gomega.Equal(int32(1)), "RenameContainer should be called once")
-			gomega.Expect(client.TestData.SetNoRestartPolicyCount.Load()).
-				To(gomega.Equal(int32(1)), "SetNoRestartPolicy should be called once for old Watchtower")
+			gomega.Expect(client.TestData.SetRestartPolicyCount.Load()).
+				To(gomega.Equal(int32(1)), "SetRestartPolicy should be called once for old Watchtower")
+			gomega.Expect(client.TestData.LastRestartPolicy.Name).
+				To(gomega.Equal(dockerContainer.RestartPolicyDisabled))
 			gomega.Expect(client.TestData.StopContainerCount.Load()).
 				To(gomega.Equal(int32(0)), "StopContainer should not be called for old Watchtower (handled by cleanup logic)")
 			gomega.Expect(client.TestData.IsContainerStaleCount.Load()).
@@ -1288,64 +1292,78 @@ var _ = ginkgo.Describe("Watchtower container handling", func() {
 	})
 })
 
+// TestSafeguardDelay verifies that a failed Watchtower self-update pull delays
+// the end of a run-once update, which is restarted at once by a restart
+// policy, while a continuous update returns at once and leaves the next
+// attempt to the schedule. The synctest clock advances by the time slept.
 func TestSafeguardDelay(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		client := mockActions.CreateMockClient(
-			&mockActions.TestData{
-				Containers: []types.Container{
-					mockActions.CreateMockContainerWithConfig(
-						"watchtower",
-						"/watchtower",
-						"watchtower:latest",
-						true,
-						false,
-						time.Now(),
-						&dockerContainer.Config{
-							Labels: map[string]string{
-								"com.centurylinklabs.watchtower": "true",
-							},
+	t.Parallel()
+
+	const delay = 5 * time.Minute
+
+	tests := []struct {
+		name    string
+		runOnce bool
+		want    time.Duration
+	}{
+		{name: "continuous update returns at once", runOnce: false, want: 0},
+		{name: "run-once update waits", runOnce: true, want: delay},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				client := mockActions.CreateMockClient(
+					&mockActions.TestData{
+						Containers: []types.Container{
+							mockActions.CreateMockContainerWithConfig(
+								"watchtower",
+								"/watchtower",
+								"watchtower:latest",
+								true,
+								false,
+								time.Now(),
+								&dockerContainer.Config{
+									Labels: map[string]string{
+										"com.centurylinklabs.watchtower": "true",
+									},
+								},
+							),
 						},
-					),
-				},
-				Staleness: map[string]bool{
-					"watchtower": true, // Simulate stale Watchtower
-				},
-			},
-			false,
-			false,
-		)
+						Staleness: map[string]bool{
+							"watchtower": true,
+						},
+					},
+					false,
+					false,
+				)
 
-		// Mock IsContainerStale to return an error (simulating pull failure)
-		client.TestData.IsContainerStaleError = errors.New("failed to pull image")
+				// The Watchtower image pull fails.
+				client.TestData.IsContainerStaleError = errors.New("failed to pull image")
 
-		report, cleanupImageInfos, err := actions.Update(testLogger(),
-			context.Background(),
-			client,
-			types.UpdateParams{
-				Cleanup:          true,
-				Filter:           filters.WatchtowerContainersFilter,
-				CPUCopyMode:      "auto",
-				PullFailureDelay: 10 * time.Millisecond,
-			},
-		)
+				start := time.Now()
 
-		synctest.Wait()
+				report, cleanupImageInfos, err := actions.Update(testLogger(),
+					t.Context(),
+					client,
+					types.UpdateParams{
+						Cleanup:          true,
+						Filter:           filters.WatchtowerContainersFilter,
+						CPUCopyMode:      "auto",
+						PullFailureDelay: delay,
+						RunOnce:          tt.runOnce,
+					},
+				)
+				require.NoError(t, err)
 
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if len(report.Updated()) != 0 {
-			t.Fatal("Watchtower should not be updated on pull failure")
-		}
-
-		if len(cleanupImageInfos) != 0 {
-			t.Fatal("No cleanup should occur on pull failure")
-		}
-
-		// Note: With synctest, the PullFailureDelay sleep is simulated.
-		// The delay behavior is verified by the test completing without hanging.
-	})
+				assert.Equal(t, tt.want, time.Since(start))
+				assert.Empty(t, report.Updated(), "Watchtower is not updated on pull failure")
+				assert.Empty(t, cleanupImageInfos, "no image is cleaned up on pull failure")
+			})
+		})
+	}
 }
 
 func TestPullFailureDelayContextCancellation(t *testing.T) {
@@ -1399,6 +1417,8 @@ func TestPullFailureDelayContextCancellation(t *testing.T) {
 					Filter:           filters.WatchtowerContainersFilter,
 					CPUCopyMode:      "auto",
 					PullFailureDelay: 100 * time.Millisecond, // Longer delay to ensure cancellation works
+					// Only a run-once update waits after a failed pull.
+					RunOnce: true,
 				},
 			)
 		}()

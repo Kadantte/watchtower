@@ -134,6 +134,31 @@ func sortByDependencies(log *zerolog.Logger, containers []types.Container, useCo
 		return nil, err
 	}
 
+	return kahnSort(log, containers, containerMap, indegree, adjacency, normalizedMap)
+}
+
+// kahnSort orders the containers of a dependency graph with Kahn's algorithm,
+// dependencies first. Ties are broken in reverse alphabetical order of the
+// container identifiers, so the order is deterministic.
+//
+// Parameters:
+//   - log: Process logger.
+//   - containers: The containers of the graph.
+//   - containerMap: Container for each identifier.
+//   - indegree: Number of dependencies of each identifier. Consumed by the sort.
+//   - adjacency: Dependents of each identifier.
+//   - normalizedMap: Identifier of each container.
+//
+// Returns:
+//   - []types.Container: Sorted list in dependency order (dependencies first).
+//   - error: A CircularReferenceError when not every container can be ordered.
+func kahnSort(log *zerolog.Logger,
+	containers []types.Container,
+	containerMap map[string]types.Container,
+	indegree map[string]int,
+	adjacency map[string][]string,
+	normalizedMap map[types.Container]string,
+) ([]types.Container, error) {
 	// Phase 2: Initialize processing queue with containers that have no dependencies
 	queue := initializeQueue(indegree)
 
@@ -166,7 +191,7 @@ func sortByDependencies(log *zerolog.Logger, containers []types.Container, useCo
 	}
 
 	// Phase 4: Cycle detection
-	err = detectAndReportCycle(log,
+	err := detectAndReportCycle(log,
 		sorted,
 		containers,
 		containerMap,
@@ -215,18 +240,34 @@ func buildDependencyGraph(log *zerolog.Logger,
 	containers []types.Container,
 	useComposeDependsOn bool,
 ) (map[string]types.Container, map[string]int, map[string][]string, map[types.Container]string, error) {
-	containerMap := make(map[string]types.Container)
-	indegree := make(map[string]int)
-	adjacency := make(map[string][]string)
-	normalizedMap := make(map[types.Container]string)
+	g, err := newDependencyGraph(log, containers, nil, nil, useComposeDependsOn)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 
+	return g.subgraph(containers)
+}
+
+// identifierIndex maps each container's normalized dependency identifier to
+// the container.
+//
+// Parameters:
+//   - log: Process logger.
+//   - containers: Containers to index.
+//
+// Returns:
+//   - map[string]types.Container: Container for each normalized identifier.
+//   - error: IdentifierCollisionError if containers share an identifier.
+func identifierIndex(log *zerolog.Logger, containers []types.Container) (map[string]types.Container, error) {
 	// Use temporary map to collect all containers per normalized identifier
-	tempMap := make(map[string][]types.Container)
+	tempMap := make(map[string][]types.Container, len(containers))
 
 	for _, c := range containers {
 		normalizedIdentifier := util.NormalizeContainerName(container.ResolveContainerIdentifier(c))
 		tempMap[normalizedIdentifier] = append(tempMap[normalizedIdentifier], c)
 	}
+
+	index := make(map[string]types.Container, len(tempMap))
 
 	// Check for identifier collisions
 	for identifier, dupContainers := range tempMap {
@@ -237,49 +278,81 @@ func buildDependencyGraph(log *zerolog.Logger,
 				dupContainers,
 			)
 
-			return nil, nil, nil, nil, IdentifierCollisionError{
+			return nil, IdentifierCollisionError{
 				DuplicateIdentifier: identifier,
 				AffectedContainers:  dupContainers,
 			}
 		}
-		// No collision, populate maps
-		containerMap[identifier] = dupContainers[0]
-		indegree[identifier] = 0
-		normalizedMap[dupContainers[0]] = identifier
+
+		index[identifier] = dupContainers[0]
 	}
 
-	// Lookup identifiers for link resolution: canonical keys plus unique bare names.
-	// Docs specify Watchtower depends-on and network_mode targets use container names,
-	// while Compose depends_on uses service names. Aliases bridge those forms to the
-	// canonical project-service graph keys without inventing extra Kahn nodes.
-	// The identifier set is built once and reused for every link in this graph.
-	matchIDSet, aliasToCanonical := buildLinkMatchIndexes(log, containerMap)
+	return index, nil
+}
 
-	// Build the graph by processing container links (dependencies).
-	// Edges always use canonical identifiers so Kahn's algorithm can traverse them.
-	for _, c := range containers {
-		normalizedIdentifier := normalizedMap[c]
-		// c.Links() already returns normalized container names
-		for _, normalizedLink := range c.Links(useComposeDependsOn) {
-			matchedKeys := resolveLinkToCanonicalKeys(
-				normalizedLink,
-				matchIDSet,
-				aliasToCanonical,
-			)
+// ContainerDependencies maps each container to the containers in the set that it depends on.
+//
+// Link matching is the same graph used by SortByDependencies. Callers that group
+// containers into larger units can order those units from this map.
+//
+// Parameters:
+//   - log: Process logger. Required and must be non-nil.
+//   - containers: Containers to inspect.
+//   - useComposeDependsOn: Whether Links() should include Compose depends_on labels.
+//
+// Returns:
+//   - map[types.ContainerID][]types.ContainerID: Dependent ID to dependency IDs.
+//   - error: Non-nil when dependency identifiers collide.
+func ContainerDependencies(
+	log *zerolog.Logger,
+	containers []types.Container,
+	useComposeDependsOn bool,
+) (map[types.ContainerID][]types.ContainerID, error) {
+	if len(containers) == 0 {
+		return map[types.ContainerID][]types.ContainerID{}, nil
+	}
 
-			for _, key := range matchedKeys {
-				if key == normalizedIdentifier {
-					// Self-reference: skip so the container stays indegree 0 for this link.
-					continue
-				}
+	containerMap, _, adjacency, _, err := buildDependencyGraph(log, containers, useComposeDependsOn)
+	if err != nil {
+		return nil, err
+	}
 
-				indegree[normalizedIdentifier]++
-				adjacency[key] = append(adjacency[key], normalizedIdentifier)
+	dependencies := make(map[types.ContainerID][]types.ContainerID, len(containers))
+	seen := make(map[types.ContainerID]map[types.ContainerID]struct{}, len(containers))
+
+	for dependencyKey, dependents := range adjacency {
+		dependency, ok := containerMap[dependencyKey]
+		if !ok || dependency == nil {
+			continue
+		}
+
+		dependencyID := dependency.ID()
+
+		for _, dependentKey := range dependents {
+			dependent, ok := containerMap[dependentKey]
+			if !ok || dependent == nil {
+				continue
 			}
+
+			dependentID := dependent.ID()
+			if dependentID == "" || dependentID == dependencyID {
+				continue
+			}
+
+			if seen[dependentID] == nil {
+				seen[dependentID] = make(map[types.ContainerID]struct{})
+			}
+
+			if _, exists := seen[dependentID][dependencyID]; exists {
+				continue
+			}
+
+			seen[dependentID][dependencyID] = struct{}{}
+			dependencies[dependentID] = append(dependencies[dependentID], dependencyID)
 		}
 	}
 
-	return containerMap, indegree, adjacency, normalizedMap, nil
+	return dependencies, nil
 }
 
 // buildLinkMatchIndexes builds the identifier set and alias→canonical map used when
@@ -288,7 +361,8 @@ func buildDependencyGraph(log *zerolog.Logger,
 // Each canonical ResolveContainerIdentifier is always included and never overwritten.
 // Bare container names are registered as aliases only when they uniquely identify one
 // container and do not collide with another container's canonical key, so ambiguous
-// names do not create non-deterministic edges.
+// names do not create non-deterministic edges. Docker IDs are also registered because
+// inspect stores network_mode as container:<id> until Watchtower rewrites it to a name.
 //
 // Parameters:
 //   - containerMap: Canonical identifier → container map from graph construction.
@@ -299,8 +373,8 @@ func buildDependencyGraph(log *zerolog.Logger,
 func buildLinkMatchIndexes(log *zerolog.Logger,
 	containerMap map[string]types.Container,
 ) (map[string]bool, map[string]string) {
-	// Capacity covers one canonical key plus one optional bare-name alias per container.
-	const aliasCapacityFactor = 2
+	// Capacity covers canonical key, optional bare-name alias, and Docker ID per container.
+	const aliasCapacityFactor = 3
 
 	aliasToCanonical := make(map[string]string, len(containerMap)*aliasCapacityFactor)
 
@@ -316,6 +390,15 @@ func buildLinkMatchIndexes(log *zerolog.Logger,
 	bareOwners := make(map[string]map[string]struct{})
 
 	for identifier, c := range containerMap {
+		if concrete, ok := c.(*container.Container); ok {
+			containerID := string(concrete.ID())
+			if containerID != "" && containerID != identifier {
+				if _, exists := aliasToCanonical[containerID]; !exists {
+					aliasToCanonical[containerID] = identifier
+				}
+			}
+		}
+
 		bareName := util.NormalizeContainerName(c.Name())
 		if bareName == "" || bareName == identifier {
 			continue
@@ -342,6 +425,10 @@ func buildLinkMatchIndexes(log *zerolog.Logger,
 				Str("bare_name", bareName).
 				Msg("Skipped ambiguous bare container name alias for dependency matching")
 
+			continue
+		}
+
+		if _, exists := aliasToCanonical[bareName]; exists {
 			continue
 		}
 
@@ -471,11 +558,13 @@ func ExtractServiceName(identifier string) string {
 //  1. Exact match.
 //  2. Replica prefix match: the identifier starts with "<link>-" and the suffix
 //     after the hyphen is a positive integer (Docker Compose replica numbering).
-//  3. Project-qualified suffix match (identifier ends with "-"+link), and for
-//     unhyphenated links only, ExtractServiceName equality on both sides.
-//     This strategy only succeeds when exactly one candidate matches. Multiple
-//     matches (e.g. the same service name in different projects) are treated as
-//     ambiguous and return no results.
+//  3. Project-qualified suffix match (the identifier, without a replica
+//     number, ends with "-"+link), and for unhyphenated links only,
+//     ExtractServiceName equality on both sides. This strategy only succeeds
+//     when every candidate belongs to the same service, and then returns all
+//     of its replicas. Candidates from more than one service (e.g. the same
+//     service name in different projects) are treated as ambiguous and return
+//     no results.
 //
 // Parameters:
 //   - link: Dependency link to resolve (typically from Container.Links()).
@@ -483,7 +572,7 @@ func ExtractServiceName(identifier string) string {
 //
 // Returns:
 //   - []string: Matching identifiers. Returns nil or an empty slice when there
-//     is no match or when the service-only strategy finds multiple candidates.
+//     is no match or when the service-only strategy finds more than one service.
 func FindMatchingIdentifiers(link string, identifiers []string) []string {
 	if link == "" || len(identifiers) == 0 {
 		return nil
@@ -539,32 +628,55 @@ func findMatchingIdentifiersInSet(link string, idSet map[string]bool) []string {
 		return matches
 	}
 
-	// 3. Project-qualified / service-only match (exactly one unambiguous candidate).
-	// Multi-segment links (containing "-") only use the precise "-"+link suffix so
-	// trailing-token ExtractServiceName equality cannot select an unrelated peer
-	// (e.g. link "net-proxy" must not match "myproject-other-proxy").
+	// 3. Project-qualified / service-only match: the link names exactly one
+	// service, and resolves to every replica of it. Candidates from more than
+	// one service are ambiguous and resolve to nothing.
+	// Multi-segment links (containing "-") only use the precise "-"+link suffix,
+	// ignoring a replica number, so trailing-token ExtractServiceName equality
+	// cannot select an unrelated peer (e.g. link "net-proxy" must not match
+	// "myproject-other-proxy").
 	// Unhyphenated bare service names may still match via ExtractServiceName
-	// (e.g. link "db" → "myproject-db").
+	// (e.g. link "db" → "myproject-db" or "myproject-db-1").
 	var serviceMatches []string
 
+	services := make(map[string]bool)
+	serviceSuffix := "-" + link
 	linkHasHyphen := strings.Contains(link, "-")
+
 	for identifier := range idSet {
-		if strings.HasSuffix(identifier, "-"+link) {
-			serviceMatches = append(serviceMatches, identifier)
+		service := replicaService(identifier)
 
-			continue
-		}
-
-		if !linkHasHyphen && ExtractServiceName(identifier) == link {
+		if strings.HasSuffix(identifier, serviceSuffix) || strings.HasSuffix(service, serviceSuffix) ||
+			(!linkHasHyphen && ExtractServiceName(identifier) == link) {
 			serviceMatches = append(serviceMatches, identifier)
+			services[service] = true
 		}
 	}
 
-	if len(serviceMatches) == 1 {
-		matches = append(matches, serviceMatches[0])
+	if len(services) == 1 {
+		sort.Strings(serviceMatches)
+		matches = append(matches, serviceMatches...)
 	}
 
 	return matches
+}
+
+// replicaService returns the service an identifier belongs to: the identifier
+// without a trailing replica number (e.g. "project-db" for "project-db-2").
+//
+// Parameters:
+//   - identifier: A container identifier.
+//
+// Returns:
+//   - string: The identifier without its replica number, or the identifier
+//     itself when it has none.
+func replicaService(identifier string) string {
+	i := strings.LastIndex(identifier, "-")
+	if i > 0 && IsPositiveInteger(identifier[i+1:]) {
+		return identifier[:i]
+	}
+
+	return identifier
 }
 
 // initializeQueue creates the initial processing queue for Kahn's algorithm.

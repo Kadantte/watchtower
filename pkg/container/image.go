@@ -15,6 +15,7 @@ import (
 	dockerImage "github.com/moby/moby/api/types/image"
 	dockerClient "github.com/moby/moby/client"
 
+	"github.com/nicholas-fedor/watchtower/pkg/container/oci"
 	"github.com/nicholas-fedor/watchtower/pkg/registry"
 	"github.com/nicholas-fedor/watchtower/pkg/registry/auth"
 	"github.com/nicholas-fedor/watchtower/pkg/registry/digest"
@@ -216,7 +217,7 @@ func (c imageClient) CheckContainerUpdate(
 	}
 
 	mirrorInfo := c.resolveRegistryMirrorConfig(ctx)
-	endpoints := c.buildMirrorEndpoints(mirrorInfo)
+	endpoints := c.buildMirrorEndpoints(mirrorInfo, sourceContainer.ImageName())
 
 	match, remoteDigest, err := digest.CompareDigestWithRemote(c.logger(),
 		ctx,
@@ -395,12 +396,9 @@ func (c imageClient) PullImage(
 	warnOnHeadFailed WarningStrategy,
 	params types.UpdateParams,
 ) error {
-	fields := map[string]any{
-		"container": sourceContainer.Name(),
-		"image":     sourceContainer.ImageName(),
-	}
 	clogVal := c.logger().With().
-		Fields(fields).
+		Str("container", sourceContainer.Name()).
+		Str("image", sourceContainer.ImageName()).
 		Logger()
 	clog := &clogVal
 
@@ -429,7 +427,7 @@ func (c imageClient) PullImage(
 	}
 
 	// Skip the pull if the digest matches the current image (or local-only).
-	skip, skipErr := c.shouldSkipPull(ctx, sourceContainer, opts.RegistryAuth, warnOnHeadFailed, fields)
+	skip, skipErr := c.shouldSkipPull(ctx, sourceContainer, opts.RegistryAuth, warnOnHeadFailed)
 	if skipErr != nil {
 		return skipErr
 	}
@@ -445,7 +443,7 @@ func (c imageClient) PullImage(
 		return cooldownErr
 	}
 
-	return c.performImagePull(ctx, sourceContainer.ImageName(), opts, fields)
+	return c.performImagePull(ctx, sourceContainer.ImageName(), opts)
 }
 
 // RemoveImageByID deletes an image from the Docker host.
@@ -583,6 +581,54 @@ func logImageRemovalDetails(log *zerolog.Logger, items []dockerImage.DeleteRespo
 		Msg("Image removal details")
 }
 
+// GetImageAnnotations reads the OCI annotations of an image by reference.
+//
+// This is a local Docker daemon inspect, not a registry request, so it never
+// counts against a registry rate limit. It resolves the new image's annotations
+// after a pull, which the running container's inspect cannot provide.
+//
+// A failed inspect is not an error for the caller: an image that is absent or
+// unreadable simply has no annotations, and metadata must never fail a session.
+//
+// Parameters:
+//   - ctx: Context for operation control.
+//   - imageRef: Image reference, tag or digest, to inspect.
+//
+// Returns:
+//   - oci.Annotations: Annotations from the image config labels, or empty.
+func (c imageClient) GetImageAnnotations(
+	ctx context.Context,
+	imageRef string,
+) oci.Annotations {
+	clogVal := c.logger().With().Str("image", imageRef).Logger()
+	clog := &clogVal
+
+	if imageRef == "" {
+		return oci.Annotations{}
+	}
+
+	imageInfo, err := c.api.ImageInspect(ctx, imageRef)
+	if err != nil {
+		clog.Debug().
+			Err(err).
+			Msg("Failed to inspect image for OCI annotations")
+
+		return oci.Annotations{}
+	}
+
+	if imageInfo.Config == nil {
+		return oci.Annotations{}
+	}
+
+	anns := oci.FromLabels(imageInfo.Config.Labels)
+	clog.Debug().
+		Str("version", anns.Version).
+		Str("revision", anns.Revision).
+		Msg("Read OCI annotations from image")
+
+	return anns
+}
+
 // logger returns the image client's logger, or a discarded nop if unset.
 func (c imageClient) logger() *zerolog.Logger {
 	if c.log != nil {
@@ -615,7 +661,6 @@ func newImageClient(api dockerClient.APIClient, log *zerolog.Logger) imageClient
 //   - sourceContainer: Container to check.
 //   - registryAuth: Registry authentication credentials.
 //   - warnOnHeadFailed: Strategy for logging warnings on HEAD request failures.
-//   - fields: Logging fields for context.
 //
 // Returns:
 //   - bool: True if pull can be skipped, false otherwise.
@@ -625,10 +670,10 @@ func (c imageClient) shouldSkipPull(
 	sourceContainer types.Container,
 	registryAuth string,
 	warnOnHeadFailed WarningStrategy,
-	fields map[string]any,
 ) (bool, error) {
 	clogVal := c.logger().With().
-		Fields(fields).
+		Str("container", sourceContainer.Name()).
+		Str("image", sourceContainer.ImageName()).
 		Logger()
 	clog := &clogVal
 	clog.Debug().Msg("Checking if pull is needed")
@@ -638,8 +683,9 @@ func (c imageClient) shouldSkipPull(
 	// Resolve registry mirror configuration from Docker daemon.
 	mirrorInfo := c.resolveRegistryMirrorConfig(ctx)
 
-	// Build candidate endpoints: mirrors first, then canonical (empty string).
-	endpoints := c.buildMirrorEndpoints(mirrorInfo)
+	// Build candidate endpoints: Hub mirrors first, then canonical (empty string).
+	// Non-Hub images skip daemon registry-mirrors.
+	endpoints := c.buildMirrorEndpoints(mirrorInfo, sourceContainer.ImageName())
 
 	// Compare current and remote digests, trying each endpoint.
 	// Local-only images are handled inside CompareDigest (match=true, err=nil).
@@ -697,7 +743,6 @@ func (c imageClient) shouldSkipPull(
 //   - ctx: Context for operation control.
 //   - imageName: Image to pull.
 //   - opts: Pull options with auth.
-//   - fields: Logging fields for context.
 //
 // Returns:
 //   - error: Non-nil if pull or read fails, nil on success.
@@ -705,20 +750,21 @@ func (c imageClient) performImagePull(
 	ctx context.Context,
 	imageName string,
 	opts dockerClient.ImagePullOptions,
-	fields map[string]any,
 ) error {
 	clogVal := c.logger().With().
-		Fields(fields).
+		Str("image", imageName).
 		Logger()
 	clog := &clogVal
 	clog.Debug().Msg("Initiating image pull")
 
-	pullHost, hostErr := auth.GetRegistryAddress(clog, imageName)
-	if hostErr != nil || pullHost == "" {
+	address, hostErr := auth.GetRegistryAddress(clog, imageName)
+	if hostErr != nil || address == "" {
 		clog.Debug().
 			Err(hostErr).
 			Msg("Failed to resolve registry host for rate limiting")
 	}
+
+	pullHost := ratelimit.Scope(address, opts.RegistryAuth != "")
 
 	pullErr := ratelimit.Do(ctx, clog, pullHost, func() error {
 		err := acquirePullSlot(ctx, pullHost)

@@ -14,10 +14,14 @@ const (
 	minHonorWait = 100 * time.Millisecond
 	// maxHonorWait is the longest Retry-After this process will sleep in one update cycle.
 	maxHonorWait = 30 * time.Second
-	// maxRetryTries is the attempt cap passed to cenkalti/backoff.
-	maxRetryTries = 5
-	// maxRetryElapsed bounds how long a single operation keeps retrying 429s.
+	// maxRetryElapsed is the production in-cycle bound for honoring a usable
+	// Retry-After, counted from the first throttle.
 	maxRetryElapsed = 30 * time.Second
+	// maxBucketRetryElapsed is the production in-cycle bound for retrying
+	// token-bucket 429s, counted from the first throttle. Shared GHCR org buckets
+	// stay empty for up to two minutes past the hour, and one daemon pull attempt
+	// can take most of a minute to report a 429.
+	maxBucketRetryElapsed = 3 * time.Minute
 	// DefaultBodyLimit is how many response bytes we read when parsing a 429.
 	DefaultBodyLimit = 4096
 	// retryAfterCaptureCount is the expected regex group count for retry-after.
@@ -26,6 +30,14 @@ const (
 	allowedCaptureCount = 3
 	// equalJitterDivisor splits a wait into the equal-jitter half range.
 	equalJitterDivisor = 2
+)
+
+// Retry budgets. Tests shorten them so budget exhaustion does not sleep for real.
+var (
+	// retryElapsed bounds how long one operation keeps honoring a usable Retry-After.
+	retryElapsed = maxRetryElapsed
+	// bucketRetryElapsed bounds how long one operation keeps retrying token-bucket 429s.
+	bucketRetryElapsed = maxBucketRetryElapsed
 )
 
 // Error is a registry 429 with the wait and quota the registry advertised.
@@ -120,4 +132,20 @@ func Decision(info *Error) (time.Duration, bool) {
 	}
 
 	return wait, false
+}
+
+// isTokenBucket reports whether info is a bucket refill signal rather than a
+// backoff instruction.
+//
+// A Retry-After below minHonorWait, or none at all, carries no usable wait. The
+// registry is saying its shared bucket is empty right now, not how long to stay
+// away, so the caller chooses its own backoff.
+//
+// Parameters:
+//   - info: Parsed rate-limit details. Nil counts as a token bucket.
+//
+// Returns:
+//   - bool: True when the Retry-After is absent or below the floor.
+func isTokenBucket(info *Error) bool {
+	return info == nil || info.RetryAfter < minHonorWait
 }

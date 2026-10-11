@@ -53,6 +53,9 @@ Environment Variable: WATCHTOWER_LABEL_ENABLE
 
     When `--label-enable` is set, only containers with `true` are monitored, ignoring those with `false` or no label.
 
+!!! Warning
+    - Dependencies on excluded containers are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
+
 ## Disable Specific Containers
 
 Excludes containers by container name from monitoring, even if they have the enable label set to `true`.
@@ -66,6 +69,9 @@ Environment Variable: WATCHTOWER_DISABLE_CONTAINERS
 
 !!! Note
     Regex patterns are supported. See [Regex Pattern Matching](../../getting-started/container-selection/index.md#regex_pattern_matching) for details.
+
+!!! Warning
+    - Dependencies on excluded containers are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
 
 ## Enable Containers by Label
 
@@ -86,6 +92,9 @@ Environment Variable: WATCHTOWER_ENABLE_CONTAINERS_BY_LABEL
     A label entry with an empty value (`key=`) performs a presence check: the label must exist on the container with any value.
     A non-empty value requires an exact match.
 
+!!! Warning
+    - Dependencies on excluded containers are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
+
 ## Disable Containers by Label
 
 Excludes containers that have any of the specified label key-value pairs from monitoring.
@@ -102,6 +111,9 @@ Environment Variable: WATCHTOWER_DISABLE_CONTAINERS_BY_LABEL
 
 !!! Note
     A label entry with an empty value (`key=`) performs a presence check: the label must exist on the container with any value. A non-empty value requires an exact match.
+
+!!! Warning
+    - Dependencies on excluded containers are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
 
 ## Monitor Specific Images
 
@@ -120,6 +132,9 @@ Environment Variable: WATCHTOWER_MONITOR_IMAGE_NAMES
     See [Regex Pattern Matching](../../getting-started/container-selection/index.md#regex_pattern_matching)
     for details.
 
+!!! Warning
+    - Dependencies on excluded containers are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
+
 ## Skip Specific Images
 
 Excludes containers by image name pattern from monitoring, even if they have the enable label set to `true`.
@@ -136,6 +151,9 @@ Environment Variable: WATCHTOWER_SKIP_IMAGE_NAMES
     Regex patterns are supported and anchored to the **full** image name.
     See [Regex Pattern Matching](../../getting-started/container-selection/index.md#regex_pattern_matching)
     for details.
+
+!!! Warning
+    - Dependencies on excluded containers are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
 
 ## Scope Filter
 
@@ -156,6 +174,9 @@ Environment Variable: WATCHTOWER_SCOPE
     Mismatched labels may prevent detection, leaving resources running.
 
     See [Running Multiple Instances](../../advanced-features/running-multiple-instances/index.md).
+
+!!! Warning
+    - Dependencies on excluded containers are ignored. See [Dependencies on Unmonitored Containers](../../advanced-features/linked-containers/index.md#dependencies_on_unmonitored_containers).
 
 ## Label Precedence
 
@@ -189,3 +210,13 @@ Environment Variable: WATCHTOWER_USE_COMPOSE_DEPENDS_ON
 !!! Warning
     Rolling restarts are not supported when any container has linked dependencies (including Docker Compose `depends_on`, Watchtower `depends-on` labels, Docker links, or network mode dependencies).
     When [`rolling-restart`](../../configuration/update-behavior/index.md#rolling_restart) is enabled, the [`use-compose-depends-on`](../../configuration/container-selection/index.md#use_docker_compose_depends-on) configuration option controls whether Docker Compose `depends_on` labels are included in the dependency validation check.
+
+## Copy Files During Recreate
+
+Copies named files from the old container into the replacement container during an update.
+
+This is a per-container label, not a Watchtower process option. Set [`com.centurylinklabs.watchtower.copy-file`](../../getting-started/container-selection/index.md#container_labels) to a comma-separated list of absolute paths inside the container.
+
+Use this for [Docker Compose configs](https://docs.docker.com/reference/compose-file/configs/){target="_blank" rel="noopener noreferrer"} that use `content:` or `environment:`. Compose `file:` configs are bind-mounts and are already preserved.
+
+See [Copy Files](../../advanced-features/copy-files/index.md) for path rules and Compose examples.

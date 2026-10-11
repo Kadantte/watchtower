@@ -31,7 +31,7 @@ jobs:
       security-events: write
     steps:
       - name: Harden the Runner (Step Security)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
@@ -46,7 +46,7 @@ jobs:
           args: "-exclude-generated -no-fail -fmt sarif -out ${{ env.OUTPUT_FILE }} ./..."
 
       - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: ${{ env.OUTPUT_FILE }}
           category: gosec-sarif
@@ -59,20 +59,20 @@ jobs:
       security-events: write
     steps:
       - name: Harden the Runner (Step Security)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
       - name: Run govulncheck
         id: govulncheck
-        uses: nicholas-fedor/govulncheck-action@2e8328bfd2a2259f6b48ad47edc8101c86e74883 # v1.0.5
+        uses: nicholas-fedor/govulncheck-action@50174c98d9b5c00eb05ab498e09f91991df69e7d # v1.1.0
         with:
           output-format: sarif
           output-file: ${{ env.OUTPUT_FILE }}
           go-version-file: "go.mod"
 
       - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: ${{ env.OUTPUT_FILE }}
           category: govulncheck-sarif
@@ -85,13 +85,13 @@ jobs:
       security-events: write
     steps:
       - name: Harden the Runner (Step Security)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
       - name: Run govulncheck
         id: govulncheck
-        uses: nicholas-fedor/govulncheck-action@2e8328bfd2a2259f6b48ad47edc8101c86e74883 # v1.0.5
+        uses: nicholas-fedor/govulncheck-action@50174c98d9b5c00eb05ab498e09f91991df69e7d # v1.1.0
         with:
           output-format: sarif
           output-file: ${{ env.OUTPUT_FILE }}
@@ -100,7 +100,7 @@ jobs:
           cache-dependency-path: tools/tplprev/go.sum
 
       - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: ${{ env.OUTPUT_FILE }}
           category: govulncheck-tplprev-sarif

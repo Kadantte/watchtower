@@ -8,9 +8,16 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
 
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	dockerContainer "github.com/moby/moby/api/types/container"
+	dockerImage "github.com/moby/moby/api/types/image"
 	testifyMock "github.com/stretchr/testify/mock"
 
+	"github.com/nicholas-fedor/watchtower/pkg/container"
+	gitPkg "github.com/nicholas-fedor/watchtower/pkg/container/git"
+	"github.com/nicholas-fedor/watchtower/pkg/container/oci"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 	mockTypes "github.com/nicholas-fedor/watchtower/pkg/types/mocks"
 )
@@ -337,6 +344,34 @@ func TestProgress_AddSkipped(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProgress_AddFailed(t *testing.T) {
+	mock := mockTypes.NewMockContainer(t)
+	mock.EXPECT().ID().Return(types.ContainerID("cont1"))
+	mock.EXPECT().ImageID().Return(types.ImageID("img1"))
+	mock.EXPECT().Name().Return("container1")
+	mock.EXPECT().ImageName().Return("image1:latest")
+	mock.EXPECT().
+		IsMonitorOnly(testifyMock.MatchedBy(func(_ types.UpdateParams) bool { return true })).
+		Return(false)
+
+	progress := Progress{}
+	failErr := errors.New("registry rate limited")
+	progress.AddFailed(testLog(), mock, failErr, types.UpdateParams{})
+
+	got := progress["cont1"]
+	if got == nil {
+		t.Fatal("Progress.AddFailed did not store the container")
+	}
+
+	if got.state != FailedState {
+		t.Errorf("Progress.AddFailed state = %v, want %v", got.state, FailedState)
+	}
+
+	if got.Error() != failErr.Error() {
+		t.Errorf("Progress.AddFailed error = %v, want %v", got.Error(), failErr.Error())
 	}
 }
 
@@ -1483,4 +1518,179 @@ func TestProgress_Restarted(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyReportMeta(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil status", func(t *testing.T) {
+		t.Parallel()
+
+		applyReportMeta(nil, reportTestContainer(t, map[string]string{
+			gitPkg.RepoLabel: "https://github.com/org/app.git",
+		}), types.UpdateParams{})
+	})
+
+	t.Run("skips mock containers", func(t *testing.T) {
+		t.Parallel()
+
+		mock := mockTypes.NewMockContainer(t)
+		status := &ContainerStatus{}
+		applyReportMeta(status, mock, types.UpdateParams{})
+		assert.Empty(t, status.GitRepo())
+	})
+
+	t.Run("copies git and oci fields from a concrete container", func(t *testing.T) {
+		t.Parallel()
+
+		c := reportTestContainer(t, map[string]string{
+			gitPkg.RepoLabel: "https://github.com/org/app.git",
+			gitPkg.RefLabel:  "main",
+		})
+		got := UpdateFromContainer(testLog(), c, "img2", ScannedState, types.UpdateParams{})
+		assert.Equal(t, "https://github.com/org/app.git", got.GitRepo())
+		assert.Equal(t, "main", got.GitRef())
+		assert.Equal(t, "https://github.com/org/app/releases", got.Changelog())
+	})
+}
+
+func TestProgressSetLatestImage(t *testing.T) {
+	t.Parallel()
+
+	id := types.ContainerID("cont1")
+	progress := Progress{
+		id: &ContainerStatus{containerID: id, newImage: "old"},
+	}
+
+	progress.SetLatestImage(testLog(), id, "sha256:gitbuilt")
+	assert.Equal(t, types.ImageID("sha256:gitbuilt"), progress[id].LatestImageID())
+
+	progress.SetLatestImage(testLog(), "missing", "ignored")
+	assert.NotContains(t, progress, types.ContainerID("missing"))
+}
+
+func TestProgressSetLatestImageMeta(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil container", func(t *testing.T) {
+		t.Parallel()
+
+		meta := Progress{}.SetLatestImageMeta(
+			testLog(),
+			nil,
+			types.UpdateParams{},
+			container.ChangelogVars{},
+			oci.Annotations{},
+		)
+		assert.Equal(t, container.ReportMeta{}, meta)
+	})
+
+	t.Run("unknown container", func(t *testing.T) {
+		t.Parallel()
+
+		c := reportTestContainer(t, map[string]string{
+			gitPkg.ChangelogURLLabel: "https://example.com/{tag}",
+		})
+		meta := Progress{}.SetLatestImageMeta(
+			testLog(),
+			c,
+			types.UpdateParams{},
+			container.ChangelogVars{Tag: "v1.0.0"},
+			oci.Annotations{},
+		)
+		assert.Equal(t, container.ReportMeta{}, meta)
+	})
+
+	t.Run("substitutes new tag", func(t *testing.T) {
+		t.Parallel()
+
+		c := reportTestContainer(t, map[string]string{
+			gitPkg.RepoLabel:         "https://github.com/org/app.git",
+			gitPkg.ChangelogURLLabel: "https://example.com/notes/{tag}",
+		})
+		status := UpdateFromContainer(testLog(), c, "img", ScannedState, types.UpdateParams{})
+		progress := Progress{c.ID(): status}
+
+		progress.SetLatestImageMeta(
+			testLog(),
+			c,
+			types.UpdateParams{},
+			container.ChangelogVars{Tag: "v1.2.3", Commit: "deadbeef"},
+			oci.Annotations{},
+		)
+		assert.Equal(t, "https://example.com/notes/v1.2.3", status.Changelog())
+	})
+
+	t.Run("derives a versioned releases url from a probed tag", func(t *testing.T) {
+		t.Parallel()
+
+		c := reportTestContainer(t, map[string]string{
+			gitPkg.RepoLabel: "https://github.com/org/app.git",
+		})
+		status := UpdateFromContainer(testLog(), c, "img", ScannedState, types.UpdateParams{})
+		progress := Progress{c.ID(): status}
+
+		meta := progress.SetLatestImageMeta(
+			testLog(),
+			c,
+			types.UpdateParams{},
+			container.ChangelogVars{Tag: "v1.2.3"},
+			oci.Annotations{Version: "1.2.3", Revision: "newrev"},
+		)
+
+		assert.Equal(t, "https://github.com/org/app/releases/tag/v1.2.3", meta.Changelog)
+		assert.Equal(t, "https://github.com/org/app/releases/tag/v1.2.3", status.Changelog())
+		assert.Equal(t, "1.2.3", status.LatestImageVersion())
+		assert.Equal(t, "newrev", status.LatestImageRevision())
+		assert.Empty(t, status.CurrentImageVersion())
+	})
+
+	t.Run("a git rebuild leaves the latest version empty", func(t *testing.T) {
+		t.Parallel()
+
+		c := reportTestContainer(t, map[string]string{
+			gitPkg.RepoLabel: "https://github.com/org/app.git",
+		})
+		status := UpdateFromContainer(testLog(), c, "img", ScannedState, types.UpdateParams{})
+		progress := Progress{c.ID(): status}
+
+		progress.SetLatestImageMeta(
+			testLog(),
+			c,
+			types.UpdateParams{},
+			container.ChangelogVars{Tag: "v9.9.9", Commit: "deadbeef"},
+			oci.Annotations{},
+		)
+
+		assert.Equal(t, "https://github.com/org/app/releases/tag/v9.9.9", status.Changelog())
+		assert.Empty(t, status.LatestImageVersion())
+	})
+}
+
+// reportTestContainer builds a concrete container used to exercise applyReportMeta.
+//
+// Parameters:
+//   - t: Test handle.
+//   - labels: Container config labels.
+//
+// Returns:
+//   - *container.Container: Container with inspect metadata.
+func reportTestContainer(t *testing.T, labels map[string]string) *container.Container {
+	t.Helper()
+
+	cfg := &dockerspec.DockerOCIImageConfig{}
+	cfg.Labels = map[string]string{}
+
+	return container.NewContainer(nil, &dockerContainer.InspectResponse{
+		ID:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Name: "/app",
+		Config: &dockerContainer.Config{
+			Image:  "myapp:latest",
+			Labels: labels,
+		},
+	}, &dockerImage.InspectResponse{
+		ID:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Config:   cfg,
+		RepoTags: []string{"myapp:latest"},
+	})
 }

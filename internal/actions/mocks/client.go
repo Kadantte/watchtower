@@ -11,8 +11,15 @@ import (
 
 	dockerContainer "github.com/moby/moby/api/types/container"
 
+	"github.com/nicholas-fedor/watchtower/pkg/container"
+	"github.com/nicholas-fedor/watchtower/pkg/container/oci"
 	"github.com/nicholas-fedor/watchtower/pkg/types"
 )
+
+// MockClient must satisfy the client interface. This mock is hand written
+// rather than generated, so nothing else would report a missing or renamed
+// method until a test happened to pass it where the interface is required.
+var _ container.Client = MockClient{}
 
 // MockClient is a mock implementation of a Watchtower Client for testing purposes.
 // It simulates container operations with configurable behavior defined by TestData.
@@ -39,7 +46,7 @@ type TestData struct {
 	LastRenameTarget             string                                // Last new name passed to RenameContainer.
 	RenameTargets                []string                              // Ordered list of rename targets.
 	UpdateContainerCount         atomic.Int32                          // Number of times UpdateContainer was called.
-	SetNoRestartPolicyCount      atomic.Int32                          // Number of times SetNoRestartPolicy was called.
+	SetRestartPolicyCount        atomic.Int32                          // Number of times SetRestartPolicy was called.
 	IsContainerStaleCount        atomic.Int32                          // Number of times IsContainerStale was called.
 	WaitForContainerHealthyCount atomic.Int32                          // Number of times WaitForContainerHealthy was called.
 	ListContainersCount          atomic.Int32                          // Number of times ListContainers was called.
@@ -62,24 +69,26 @@ type TestData struct {
 	CreateOrder                  []string                              // Order in which containers were created.
 	StartOrder                   []string                              // Order in which containers were started.
 	// OperationOrder records client method names in call order for handoff sequencing assertions.
-	OperationOrder              []string
-	RemoveContainerCount        atomic.Int32                  // Number of times RemoveContainer was called.
-	SimulatedLatency            time.Duration                 // Simulated latency for operations (default 0 for fast tests, set for context cancellation tests).
-	LastContainerChain          string                        // Last container chain passed to CreateEphemeralOrchestrator.
-	LastCleanup                 bool                          // Last cleanup flag passed to CreateEphemeralOrchestrator.
-	LastUpdateConfig            *dockerContainer.UpdateConfig // Last UpdateContainer config received.
-	LastStartedContainer        types.Container               // Last container passed to StartContainer.
-	LastStartedContainerID      types.ContainerID             // ID returned by the last successful StartContainer call.
-	SetNoRestartPolicyContainer types.Container               // Last container passed to SetNoRestartPolicy.
-	SetNoRestartPolicyCtx       context.Context               // Last context passed to SetNoRestartPolicy.
-	CreateContainerCtx          context.Context               // Last context passed to CreateContainer.
-	RenameContainerCtx          context.Context               // Last context passed to RenameContainer.
-	StartContainerByIDCtx       context.Context               // Last context passed to StartContainerByID.
-	GetContainerCtx             context.Context               // Last context passed to GetContainer.
-	StopAndRemoveContainerCtx   context.Context               // Last context passed to StopAndRemoveContainer.
-	GetImageDiskUsageCount      atomic.Int32                  // Number of times GetImageDiskUsage was called.
-	ImageDiskUsage              types.ImageDiskUsage          // Usage returned by GetImageDiskUsage.
-	GetImageDiskUsageError      error                         // Error to return from GetImageDiskUsage.
+	OperationOrder            []string
+	RemoveContainerCount      atomic.Int32                  // Number of times RemoveContainer was called.
+	SimulatedLatency          time.Duration                 // Simulated latency for operations (default 0 for fast tests, set for context cancellation tests).
+	LastContainerChain        string                        // Last container chain passed to CreateEphemeralOrchestrator.
+	LastCleanup               bool                          // Last cleanup flag passed to CreateEphemeralOrchestrator.
+	LastUpdateConfig          *dockerContainer.UpdateConfig // Last UpdateContainer config received.
+	LastStartedContainer      types.Container               // Last container passed to StartContainer.
+	LastStartedContainerID    types.ContainerID             // ID returned by the last successful StartContainer call.
+	SetRestartPolicyContainer types.Container               // Last container passed to SetRestartPolicy.
+	SetRestartPolicyCtx       context.Context               // Last context passed to SetRestartPolicy.
+	LastRestartPolicy         dockerContainer.RestartPolicy // Last policy passed to SetRestartPolicy.
+	CreateContainerCtx        context.Context               // Last context passed to CreateContainer.
+	RenameContainerCtx        context.Context               // Last context passed to RenameContainer.
+	StartContainerByIDCtx     context.Context               // Last context passed to StartContainerByID.
+	GetContainerCtx           context.Context               // Last context passed to GetContainer.
+	StopAndRemoveContainerCtx context.Context               // Last context passed to StopAndRemoveContainer.
+	GetImageDiskUsageCount    atomic.Int32                  // Number of times GetImageDiskUsage was called.
+	ImageDiskUsage            types.ImageDiskUsage          // Usage returned by GetImageDiskUsage.
+	GetImageDiskUsageError    error                         // Error to return from GetImageDiskUsage.
+	ImageAnnotations          map[string]oci.Annotations    // OCI annotations returned per image reference.
 }
 
 // recordOperation appends an operation name to OperationOrder for sequencing tests.
@@ -391,13 +400,17 @@ func (client MockClient) UpdateContainer(ctx context.Context, _ types.Container,
 	return client.TestData.UpdateContainerError
 }
 
-// SetNoRestartPolicy simulates setting a container's restart policy to "no".
-// It increments the SetNoRestartPolicyCount and records the container and context for test assertions.
-func (client MockClient) SetNoRestartPolicy(ctx context.Context, container types.Container) {
-	client.TestData.SetNoRestartPolicyCount.Add(1)
-	client.TestData.SetNoRestartPolicyContainer = container
-	client.TestData.SetNoRestartPolicyCtx = ctx
-	client.TestData.recordOperation("SetNoRestartPolicy")
+// SetRestartPolicy simulates updating a container's restart policy.
+func (client MockClient) SetRestartPolicy(
+	ctx context.Context,
+	container types.Container,
+	policy dockerContainer.RestartPolicy,
+) {
+	client.TestData.SetRestartPolicyCount.Add(1)
+	client.TestData.SetRestartPolicyContainer = container
+	client.TestData.SetRestartPolicyCtx = ctx
+	client.TestData.LastRestartPolicy = policy
+	client.TestData.recordOperation("SetRestartPolicy")
 }
 
 // RemoveImageByID increments the count of image removal attempts in TestData.
@@ -517,6 +530,25 @@ func (client MockClient) CheckContainerUpdate(
 	return client.IsContainerStale(ctx, container, params)
 }
 
+// GetImageAnnotations returns the annotations configured for an image reference.
+//
+// Parameters:
+//   - ctx: Context for operation control.
+//   - imageRef: Image reference, tag or digest, to inspect.
+//
+// Returns:
+//   - oci.Annotations: Configured annotations, or empty when none are set.
+func (client MockClient) GetImageAnnotations(
+	_ context.Context,
+	imageRef string,
+) oci.Annotations {
+	if client.TestData == nil {
+		return oci.Annotations{}
+	}
+
+	return client.TestData.ImageAnnotations[imageRef]
+}
+
 // WarnOnHeadPullFailed always returns true for the mock client.
 // It simulates a warning condition for HEAD pull failures in tests.
 func (client MockClient) WarnOnHeadPullFailed(_ types.Container) bool {
@@ -588,20 +620,36 @@ func (client MockClient) GetImageDiskUsage(ctx context.Context) (types.ImageDisk
 }
 
 // GetInfo returns mock system information for testing.
-// It provides a basic map with mock Docker/Podman info.
-func (client MockClient) GetInfo(ctx context.Context) (map[string]any, error) {
+func (client MockClient) GetInfo(ctx context.Context) (types.SystemInfo, error) {
 	if err := client.checkContextCancellation(ctx); err != nil {
-		return nil, err
+		return types.SystemInfo{}, err
 	}
 
-	return map[string]any{
-		"Name":          "docker",
-		"ServerVersion": "1.50",
-		"OSType":        "linux",
+	return types.SystemInfo{
+		Name:          "docker",
+		ServerVersion: "1.50",
+		OSType:        "linux",
 	}, nil
 }
 
 // Ping returns nil to simulate a healthy Docker daemon.
 func (client MockClient) Ping(ctx context.Context) error {
 	return client.checkContextCancellation(ctx)
+}
+
+// BuildRemoteImage simulates building an image from a Git URL context.
+func (client MockClient) BuildRemoteImage(ctx context.Context, _, _ string, tags []string) (types.ImageID, error) {
+	if err := client.checkContextCancellation(ctx); err != nil {
+		return "", err
+	}
+
+	if client.TestData != nil {
+		client.TestData.recordOperation("BuildRemoteImage")
+	}
+
+	if len(tags) > 0 {
+		return types.ImageID("sha256:gitbuild" + tags[0]), nil
+	}
+
+	return types.ImageID("sha256:gitbuild"), nil
 }

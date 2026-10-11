@@ -55,6 +55,8 @@ Environment Variable: DOCKER_CONFIG
 
     See [Usage](../../getting-started/usage/index.md) and [Private Registries](../../advanced-features/private-registries/index.md).
 
+    Public `lscr.io` images are hosted on GitHub Container Registry. Watchtower remaps them to `ghcr.io` for digest checks. Authenticate to **`ghcr.io`** in this config (not only `lscr.io`) to separate your checks from anonymous throttling and restore parallel GHCR checks. Pulls of a public org can still share that org's bucket, which is empty for the first minute or two of each hour.
+
 ### Skip Registry TLS Verification
 
 Disables TLS certificate verification for registry connections, useful for self-signed certificates or insecure registries.

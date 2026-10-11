@@ -58,6 +58,7 @@ func WaitForRunningUpdate(log *zerolog.Logger, ctx context.Context, lock chan bo
 // BaseParams must be a complete types.UpdateParams snapshot from config.UpdateParams
 // (or an equivalent full construction).
 // Each tick copies BaseParams and applies only per-run fields such as SkipSelfUpdate.
+// A tick can disable self-updates, but never enables them when BaseParams disables them.
 type ScheduleDeps struct {
 	// Logger is the process logger for scheduled runs. Required and must be non-nil.
 	Logger *zerolog.Logger
@@ -197,7 +198,7 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 
 		params := deps.BaseParams
 		params.RunOnce = false
-		params.SkipSelfUpdate = skipWatchtowerSelfUpdate
+		params.SkipSelfUpdate = skipWatchtowerSelfUpdate || deps.BaseParams.SkipSelfUpdate
 
 		// One filter for this tick: schedule filter when set, else BaseParams.
 		// Keep params.Filter and the positional argument identical so
@@ -282,7 +283,9 @@ func RunUpgradesOnSchedule(ctx context.Context, deps ScheduleDeps) error {
 	}
 
 	// Check if update-on-start is enabled and trigger immediate update if so.
-	if deps.UpdateOnStart {
+	// Skip it when the process is already stopping, so a canceled update is not
+	// reported as a failure.
+	if deps.UpdateOnStart && ctx.Err() == nil {
 		updateFunc(false, false)
 	}
 

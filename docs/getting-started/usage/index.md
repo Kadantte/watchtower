@@ -9,7 +9,7 @@ Watchtower is released as a container image, which makes getting started as simp
 
 ### Docker Socket Requirement
 
-Since Watchtower needs to interact with the Docker API in order to monitor and update containers, you need to mount `/var/run/docker.sock` to the Watchtower container with the `-v` flag.
+Since Watchtower needs to interact with the Docker API in order to monitor and update containers, you need to mount `/var/run/docker.sock` to the Watchtower container with the `-v` flag or specify a host with the `DOCKER_HOST` [variable](../../configuration/docker-connection/index.md#docker_host).
 
 ### Docker Engine Dependency
 
@@ -38,6 +38,11 @@ docker run -d \
   --restart unless-stopped \
   nickfedor/watchtower
 ```
+
+### Git Monitoring
+
+Registry digest comparison is the default staleness signal.
+To rebuild from source when a hosted Git branch or tag changes, see [Git Monitoring](../../advanced-features/git-monitoring/index.md).
 
 ### Private Registries
 
